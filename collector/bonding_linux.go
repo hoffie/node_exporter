@@ -17,17 +17,15 @@ package collector
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/procfs/sysfs"
 )
 
 type bondingCollector struct {
+	fs             sysfs.FS
 	slaves, active typedDesc
 	logger         log.Logger
 }
@@ -39,7 +37,12 @@ func init() {
 // NewBondingCollector returns a newly allocated bondingCollector.
 // It exposes the number of configured and active slave of linux bonding interfaces.
 func NewBondingCollector(logger log.Logger) (Collector, error) {
+	fs, err := sysfs.NewFS(*sysPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sysfs: %w", err)
+	}
 	return &bondingCollector{
+		fs: fs,
 		slaves: typedDesc{prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "bonding", "slaves"),
 			"Number of configured slaves per bonding interface.",
@@ -56,49 +59,23 @@ func NewBondingCollector(logger log.Logger) (Collector, error) {
 
 // Update reads and exposes bonding states, implements Collector interface. Caution: This works only on linux.
 func (c *bondingCollector) Update(ch chan<- prometheus.Metric) error {
-	statusfile := sysFilePath("class/net")
-	bondingStats, err := readBondingStats(statusfile)
+	bondingStats, err := c.fs.NetClassBonding()
 	if err != nil {
-		if os.IsNotExist(err) {
-			level.Debug(c.logger).Log("msg", "Not collecting bonding, file does not exist", "file", statusfile)
-			return ErrNoData
-		}
 		return err
 	}
-	for master, status := range bondingStats {
-		ch <- c.slaves.mustNewConstMetric(float64(status[0]), master)
-		ch <- c.active.mustNewConstMetric(float64(status[1]), master)
+	if bondingStats == nil {
+		level.Debug(c.logger).Log("msg", "Not collecting bonding, no bonds found")
+		return ErrNoData
+	}
+	for master, bondingInfo := range bondingStats {
+		ch <- c.slaves.mustNewConstMetric(float64(len(bondingInfo.Slaves)), master)
+		active := 0
+		for _, slave := range bondingInfo.Slaves {
+			if slave.MiiStatus == 1 {
+				active++
+			}
+		}
+		ch <- c.active.mustNewConstMetric(float64(active), master)
 	}
 	return nil
-}
-
-func readBondingStats(root string) (status map[string][2]int, err error) {
-	status = map[string][2]int{}
-	masters, err := ioutil.ReadFile(filepath.Join(root, "bonding_masters"))
-	if err != nil {
-		return nil, err
-	}
-	for _, master := range strings.Fields(string(masters)) {
-		slaves, err := ioutil.ReadFile(filepath.Join(root, master, "bonding", "slaves"))
-		if err != nil {
-			return nil, err
-		}
-		sstat := [2]int{0, 0}
-		for _, slave := range strings.Fields(string(slaves)) {
-			state, err := ioutil.ReadFile(filepath.Join(root, master, fmt.Sprintf("lower_%s", slave), "bonding_slave", "mii_status"))
-			if os.IsNotExist(err) {
-				// some older? kernels use slave_ prefix
-				state, err = ioutil.ReadFile(filepath.Join(root, master, fmt.Sprintf("slave_%s", slave), "bonding_slave", "mii_status"))
-			}
-			if err != nil {
-				return nil, err
-			}
-			sstat[0]++
-			if strings.TrimSpace(string(state)) == "up" {
-				sstat[1]++
-			}
-		}
-		status[master] = sstat
-	}
-	return status, err
 }

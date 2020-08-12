@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/prometheus/procfs/internal/util"
 )
@@ -58,6 +59,18 @@ type NetClassIface struct {
 	Type             *int64 // /sys/class/net/<iface>/type
 }
 
+type NetClassIfaceBondingSlave struct {
+	Name      string
+	MiiStatus int64 // /sys/class/net/<iface>/bonding/mii_status
+}
+
+type NetClassIfaceBonding struct {
+	Name   string
+	Slaves map[string]NetClassIfaceBondingSlave
+}
+
+type NetClassBonding map[string]NetClassIfaceBonding
+
 // NetClass is collection of info for every interface (iface) in /sys/class/net. The map keys
 // are interface (iface) names.
 type NetClass map[string]NetClassIface
@@ -80,6 +93,62 @@ func (fs FS) NetClassDevices() ([]string, error) {
 	}
 
 	return res, nil
+}
+
+// NetClassBondingMasters scans /sys/class/net/bonding_masters and returns them as a list of names.
+func (fs FS) NetClassBondingMasters() ([]string, error) {
+	masters, err := ioutil.ReadFile(filepath.Join(fs.sys.Path(netclassPath), "bonding_masters"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// If bonding_masters does not exist, this means there are no bonds.
+			return nil, nil
+		}
+		return nil, err
+	}
+	return strings.Fields(string(masters)), nil
+}
+
+func (fs FS) NetClassBonding() (NetClassBonding, error) {
+	masters, err := fs.NetClassBondingMasters()
+	if err != nil {
+		return nil, err
+	}
+	netClassBonding := NetClassBonding{}
+	for _, master := range masters {
+		bondingInfo, err := netClassBonding.parseBond(filepath.Join(fs.sys.Path(netclassPath), master, "bonding"))
+		if err != nil {
+			return nil, err
+		}
+		netClassBonding[master] = *bondingInfo
+	}
+	return netClassBonding, nil
+}
+
+// parseBond parses mii_status per slave of a bond interface
+func (ncb NetClassBonding) parseBond(path string) (*NetClassIfaceBonding, error) {
+	content, err := ioutil.ReadFile(filepath.Join(path, "slaves"))
+	if err != nil {
+		return nil, err
+	}
+	bonding := NetClassIfaceBonding{}
+	for _, name := range strings.Fields(string(content)) {
+		state, err := ioutil.ReadFile(filepath.Join(path, fmt.Sprintf("lower_%s", name), "bonding_slave", "mii_status"))
+		if os.IsNotExist(err) {
+			// some older? kernels use slave_ prefix
+			state, err = ioutil.ReadFile(filepath.Join(path, fmt.Sprintf("slave_%s", name), "bonding_slave", "mii_status"))
+		}
+		if err != nil {
+			return nil, err
+		}
+		slave := NetClassIfaceBondingSlave{
+			Name: name,
+		}
+		if strings.TrimSpace(string(state)) == "up" {
+			slave.MiiStatus = 1
+		}
+		bonding.Slaves[name] = slave
+	}
+	return &bonding, nil
 }
 
 // NetClass returns info for all net interfaces (iface) read from /sys/class/net/<iface>.
